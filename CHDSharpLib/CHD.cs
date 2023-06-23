@@ -248,7 +248,11 @@ public static class CHD
         using SHA1 sha1Check = chd.rawsha1 != null ? SHA1.Create() : null;
 
         int taskCount = taskCounter;
-        using BlockingCollection<int> blocksToDecompress = new BlockingCollection<int>(boundedCapacity: taskCount * 5);
+        BlockingThreadQueue<int> queue = new BlockingThreadQueue<int>(taskCount * 5, taskCount * 5);
+        CHDCodec[] threadsState = new CHDCodec[taskCount * 5];
+        for (int i = 0; i < threadsState.Length; i++)
+            threadsState[i] = new CHDCodec();
+        //using BlockingCollection<int> blocksToDecompress = new BlockingCollection<int>(boundedCapacity: taskCount * 5);
         using BlockingCollection<int> blocksToHash = new BlockingCollection<int>(boundedCapacity: taskCount * 5);
         chd_error errMaster = chd_error.CHDERR_NONE;
 
@@ -262,98 +266,43 @@ public static class CHD
         ArrayPool arrPoolCache = new ArrayPool(chd.blocksize);
         Semaphore aheadLock = new Semaphore(taskCount * 100, taskCount * 100);
 
-        Task producerThread = Task.Factory.StartNew(() =>
+        Task decompressionThread = queue.Process((blockObj, threadIdx) =>
         {
             try
             {
-                uint blockPercent = chd.totalblocks / 100;
-                if (blockPercent == 0)
-                    blockPercent = 1;
+                CHDCodec codec = threadsState[threadIdx];
 
-                for (int block = 0; block < chd.totalblocks; block++)
+                aheadLock.WaitOne();
+                int block = (int)blockObj; //blocksToDecompress.Take(ct);
+                mapentry mapentry = chd.map[block];
+
+                mapentry.buffOut = arrPoolOut.Rent();
+                chd_error err = CHDBlockRead.ReadBlock(mapentry, arrPoolCache, chd.chdReader, codec, mapentry.buffOut, (int)chd.blocksize);
+                if (err != chd_error.CHDERR_NONE)
                 {
-                    if (ct.IsCancellationRequested)
-                        break;
-
-                    /* progress */
-                    if ((block % blockPercent) == 0)
-                        Console.Write($"Verifying: {(long)block * 100 / chd.totalblocks:N0}%     Load buffer: {blocksToDecompress.Count}   Hash buffer: {blocksToHash.Count}   \r");
-
-                    mapentry mapentry = chd.map[block];
-
-                    if (mapentry.length > 0)
-                    {
-                        file.Seek((long)mapentry.offset, SeekOrigin.Begin);
-                        mapentry.buffIn = arrPoolIn.Rent();
-                        file.Read(mapentry.buffIn, 0, (int)mapentry.length);
-                    }
-
-                    blocksToDecompress.Add(block, ct);
+                    ts.Cancel();
+                    errMaster = err;
+                    return;
                 }
-                // this must be done to tell all the decompression threads to stop working and return.
-                for (int i = 0; i < taskCount; i++)
-                    blocksToDecompress.Add(-1);
+                blocksToHash.Add(block);
 
+                if (mapentry.length > 0)
+                {
+                    arrPoolIn.Return(mapentry.buffIn);
+                    mapentry.buffIn = null;
+                }
             }
             catch (Exception e)
             {
                 if (ct.IsCancellationRequested)
                     return;
-
                 if (errMaster == chd_error.CHDERR_NONE)
-                    errMaster = chd_error.CHDERR_INVALID_FILE;
+                    errMaster = chd_error.CHDERR_DECOMPRESSION_ERROR;
                 ts.Cancel();
             }
         });
-        allTasks.Add(producerThread);
+        allTasks.Add(decompressionThread);
 
-
-
-
-        for (int i = 0; i < taskCount; i++)
-        {
-            Task decompressionThread = Task.Factory.StartNew(() =>
-            {
-                try
-                {
-                    CHDCodec codec = new CHDCodec();
-                    while (true)
-                    {
-                        aheadLock.WaitOne();
-                        int block = blocksToDecompress.Take(ct);
-                        if (block == -1)
-                            return;
-                        mapentry mapentry = chd.map[block];
-                        mapentry.buffOut = arrPoolOut.Rent();
-                        chd_error err = CHDBlockRead.ReadBlock(mapentry, arrPoolCache, chd.chdReader, codec, mapentry.buffOut, (int)chd.blocksize);
-                        if (err != chd_error.CHDERR_NONE)
-                        {
-                            ts.Cancel();
-                            errMaster = err;
-                            return;
-                        }
-                        blocksToHash.Add(block);
-
-                        if (mapentry.length > 0)
-                        {
-                            arrPoolIn.Return(mapentry.buffIn);
-                            mapentry.buffIn = null;
-                        }
-                    }
-                }
-                catch (Exception e)
-                {
-                    if (ct.IsCancellationRequested)
-                        return;
-                    if (errMaster == chd_error.CHDERR_NONE)
-                        errMaster = chd_error.CHDERR_DECOMPRESSION_ERROR;
-                    ts.Cancel();
-                }
-            });
-
-            allTasks.Add(decompressionThread);
-
-        }
 
         ulong sizetoGo = chd.totalbytes;
         int proc = 0;
@@ -400,6 +349,32 @@ public static class CHD
 
         });
         allTasks.Add(hashingThread);
+
+        uint blockPercent = chd.totalblocks / 100;
+        if (blockPercent == 0)
+            blockPercent = 1;
+
+        for (int block = 0; block < chd.totalblocks; block++)
+        {
+            if (ct.IsCancellationRequested)
+                break;
+
+            /* progress */
+            if ((block % blockPercent) == 0)
+                Console.Write($"Verifying: {(long)block * 100 / chd.totalblocks:N0}%     Load buffer: {queue.QueueCount}   Hash buffer: {blocksToHash.Count}   \r");
+
+            mapentry mapentry = chd.map[block];
+
+            if (mapentry.length > 0)
+            {
+                file.Seek((long)mapentry.offset, SeekOrigin.Begin);
+                mapentry.buffIn = arrPoolIn.Rent();
+                file.Read(mapentry.buffIn, 0, (int)mapentry.length);
+            }
+
+            queue.Add(block); //add ct support
+        }
+        queue.AddComplete();
 
         Task.WaitAll(allTasks.ToArray());
 
