@@ -48,9 +48,6 @@ internal class mapentry
     public byte[] buffOutCache = null;
     public byte[] buffOut = null;
 
-    // Used in Parallel decompress to keep the blocks in order when hashing.
-    //public bool Processed = false;
-
 
     // Used to calculate which blocks should have buffered copies kept.
     public int UsageWeight;
@@ -167,77 +164,6 @@ public static class CHD
     }
 
 
-    internal static chd_error DecompressData(Stream file, CHDHeader chd)
-    {
-        // stores the FLAC decompression classes for this instance.
-        CHDCodec codec = new CHDCodec();
-
-        using BinaryReader br = new BinaryReader(file, Encoding.UTF8, true);
-
-        using MD5 md5Check = chd.md5 != null ? MD5.Create() : null;
-        using SHA1 sha1Check = chd.rawsha1 != null ? SHA1.Create() : null;
-
-        ArrayPool arrPool = new ArrayPool(chd.blocksize);
-
-        byte[] buffer = new byte[chd.blocksize];
-
-        int block = 0;
-        ulong sizetoGo = chd.totalbytes;
-        while (sizetoGo > 0)
-        {
-            /* progress */
-            if ((block % 1000) == 0)
-                Console.Write($"Verifying, {(100 - sizetoGo * 100 / chd.totalbytes):N1}% complete...\r");
-
-            mapentry mapEntry = chd.map[block];
-            if (mapEntry.length > 0)
-            {
-                mapEntry.buffIn = arrPool.Rent();
-                file.Seek((long)mapEntry.offset, SeekOrigin.Begin);
-                file.Read(mapEntry.buffIn, 0, (int)mapEntry.length);
-            }
-
-            /* read the block into the cache */
-            chd_error err = CHDBlockRead.ReadBlock(mapEntry, arrPool, chd.chdReader, codec, buffer, (int)chd.blocksize);
-            if (err != chd_error.CHDERR_NONE)
-                return err;
-
-            if (mapEntry.length > 0)
-            {
-                arrPool.Return(mapEntry.buffIn);
-                mapEntry.buffIn = null;
-            }
-
-            int sizenext = sizetoGo > (ulong)chd.blocksize ? (int)chd.blocksize : (int)sizetoGo;
-
-            md5Check?.TransformBlock(buffer, 0, sizenext, null, 0);
-            sha1Check?.TransformBlock(buffer, 0, sizenext, null, 0);
-
-            /* prepare for the next block */
-            block++;
-            sizetoGo -= (ulong)sizenext;
-
-        }
-        Console.WriteLine($"Verifying, 100.0% complete...");
-
-        byte[] tmp = new byte[0];
-        md5Check?.TransformFinalBlock(tmp, 0, 0);
-        sha1Check?.TransformFinalBlock(tmp, 0, 0);
-
-        // here it is now using the rawsha1 value from the header to validate the raw binary data.
-        if (chd.md5 != null && !Util.IsAllZeroArray(chd.md5) && !Util.ByteArrEquals(chd.md5, md5Check.Hash))
-        {
-            return chd_error.CHDERR_DECOMPRESSION_ERROR;
-        }
-        if (chd.rawsha1 != null && !Util.IsAllZeroArray(chd.rawsha1) && !Util.ByteArrEquals(chd.rawsha1, sha1Check.Hash))
-        {
-            return chd_error.CHDERR_DECOMPRESSION_ERROR;
-        }
-
-        return chd_error.CHDERR_NONE;
-    }
-
-
     public static int taskCounter = 8;
 
     internal static chd_error DecompressDataParallel(Stream file, CHDHeader chd)
@@ -264,7 +190,7 @@ public static class CHD
 
         Task processorTask = queue.Process(
             ///////////////////////////////////////////////////////////////////////////////////////
-            // DECOMPRESS - parallel ///////////////////////////////////////////////////////////////
+            // DECOMPRESS - parallel //////////////////////////////////////////////////////////////
             (blockObj, threadIdx) =>
             {
                 try
@@ -296,7 +222,7 @@ public static class CHD
                 }
             },
             ///////////////////////////////////////////////////////////////////////////////////////
-            // HASH - linear feed in queue order ///////////////////////////////////////////////////
+            // HASH - linear feed in queue order //////////////////////////////////////////////////
             (blockObj) =>
             {
                 int sizenext = sizetoGo > (ulong)chd.blocksize ? (int)chd.blocksize : (int)sizetoGo;
@@ -314,7 +240,7 @@ public static class CHD
 
 
         ///////////////////////////////////////////////////////////////////////////////////////
-        // ENQUEUE the blocks to process /////////////////////////////////////////////////////////
+        // ENQUEUE - blocks to process ////////////////////////////////////////////////////////
 
         uint blockPercent = chd.totalblocks / 100;
         if (blockPercent == 0)
