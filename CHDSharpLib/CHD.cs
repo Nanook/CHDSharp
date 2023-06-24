@@ -191,12 +191,12 @@ public static class CHD
         Task processorTask = queue.Process(
             ///////////////////////////////////////////////////////////////////////////////////////
             // DECOMPRESS - parallel //////////////////////////////////////////////////////////////
-            (blockObj, threadIdx) =>
+            (block, threadIdx) =>
             {
                 try
                 {
                     CHDCodec codec = threadsState[threadIdx];
-                    mapentry mapentry = chd.map[(int)blockObj];
+                    mapentry mapentry = chd.map[block];
 
                     mapentry.buffOut = arrPoolOut.Rent();
                     chd_error err = CHDBlockRead.ReadBlock(mapentry, arrPoolCache, chd.chdReader, codec, mapentry.buffOut, (int)chd.blocksize);
@@ -223,11 +223,11 @@ public static class CHD
             },
             ///////////////////////////////////////////////////////////////////////////////////////
             // HASH - linear feed in queue order //////////////////////////////////////////////////
-            (blockObj) =>
+            (block) =>
             {
                 int sizenext = sizetoGo > (ulong)chd.blocksize ? (int)chd.blocksize : (int)sizetoGo;
 
-                mapentry mapentry = chd.map[(int)blockObj];
+                mapentry mapentry = chd.map[block];
 
                 md5Check?.TransformBlock(mapentry.buffOut, 0, sizenext, null, 0);
                 sha1Check?.TransformBlock(mapentry.buffOut, 0, sizenext, null, 0);
