@@ -254,7 +254,7 @@ public static class CHD
             threadsState[i] = new CHDCodec();
         chd_error errMaster = chd_error.CHDERR_NONE;
 
-        var ts = new CancellationTokenSource();
+        var ts = new CancellationTokenSource();  //need to support cancellation token once processing
         CancellationToken ct = ts.Token;
 
         ArrayPool arrPoolIn = new ArrayPool(chd.blocksize);
@@ -263,7 +263,8 @@ public static class CHD
         ulong sizetoGo = chd.totalbytes;
 
         Task processorTask = queue.Process(
-            //decompress - parallel
+            ///////////////////////////////////////////////////////////////////////////////////////
+            // DECOMPRESS - parallel ///////////////////////////////////////////////////////////////
             (blockObj, threadIdx) =>
             {
                 try
@@ -273,12 +274,11 @@ public static class CHD
 
                     mapentry.buffOut = arrPoolOut.Rent();
                     chd_error err = CHDBlockRead.ReadBlock(mapentry, arrPoolCache, chd.chdReader, codec, mapentry.buffOut, (int)chd.blocksize);
-                    //if (err != chd_error.CHDERR_NONE) //need to support cancellation token
-                    //{
-                    //    ts.Cancel();
-                    //    errMaster = err;
-                    //    return;
-                    //}
+                    if (err != chd_error.CHDERR_NONE)
+                    {
+                        ts.Cancel();
+                        errMaster = err;
+                    }
 
                     if (mapentry.length > 0)
                     {
@@ -295,7 +295,8 @@ public static class CHD
                     ts.Cancel();
                 }
             },
-            //hash - linear feed in queue order
+            ///////////////////////////////////////////////////////////////////////////////////////
+            // HASH - linear feed in queue order ///////////////////////////////////////////////////
             (blockObj) =>
             {
                 int sizenext = sizetoGo > (ulong)chd.blocksize ? (int)chd.blocksize : (int)sizetoGo;
@@ -308,10 +309,12 @@ public static class CHD
                 arrPoolOut.Return(mapentry.buffOut);
                 mapentry.buffOut = null;
                 sizetoGo -= (ulong)sizenext;
-            });
+            }
+        );
 
 
-        //queue the blocks to process
+        ///////////////////////////////////////////////////////////////////////////////////////
+        // ENQUEUE the blocks to process /////////////////////////////////////////////////////////
 
         uint blockPercent = chd.totalblocks / 100;
         if (blockPercent == 0)
