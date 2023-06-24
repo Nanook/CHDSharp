@@ -49,7 +49,7 @@ internal class mapentry
     public byte[] buffOut = null;
 
     // Used in Parallel decompress to keep the blocks in order when hashing.
-    public bool Processed = false;
+    //public bool Processed = false;
 
 
     // Used to calculate which blocks should have buffered copies kept.
@@ -248,15 +248,11 @@ public static class CHD
         using SHA1 sha1Check = chd.rawsha1 != null ? SHA1.Create() : null;
 
         int taskCount = taskCounter;
-        BlockingThreadQueue<int> queue = new BlockingThreadQueue<int>(taskCount * 5, taskCount * 5);
-        CHDCodec[] threadsState = new CHDCodec[taskCount * 5];
+        BlockingThreadQueue<int> queue = new BlockingThreadQueue<int>(10, 25, true);
+        CHDCodec[] threadsState = new CHDCodec[25];
         for (int i = 0; i < threadsState.Length; i++)
             threadsState[i] = new CHDCodec();
-        //using BlockingCollection<int> blocksToDecompress = new BlockingCollection<int>(boundedCapacity: taskCount * 5);
-        using BlockingCollection<int> blocksToHash = new BlockingCollection<int>(boundedCapacity: taskCount * 5);
         chd_error errMaster = chd_error.CHDERR_NONE;
-
-        List<Task> allTasks = new List<Task>();
 
         var ts = new CancellationTokenSource();
         CancellationToken ct = ts.Token;
@@ -264,91 +260,58 @@ public static class CHD
         ArrayPool arrPoolIn = new ArrayPool(chd.blocksize);
         ArrayPool arrPoolOut = new ArrayPool(chd.blocksize);
         ArrayPool arrPoolCache = new ArrayPool(chd.blocksize);
-        Semaphore aheadLock = new Semaphore(taskCount * 100, taskCount * 100);
-
-        Task decompressionThread = queue.Process((blockObj, threadIdx) =>
-        {
-            try
-            {
-                CHDCodec codec = threadsState[threadIdx];
-
-                aheadLock.WaitOne();
-                int block = (int)blockObj; //blocksToDecompress.Take(ct);
-                mapentry mapentry = chd.map[block];
-
-                mapentry.buffOut = arrPoolOut.Rent();
-                chd_error err = CHDBlockRead.ReadBlock(mapentry, arrPoolCache, chd.chdReader, codec, mapentry.buffOut, (int)chd.blocksize);
-                if (err != chd_error.CHDERR_NONE)
-                {
-                    ts.Cancel();
-                    errMaster = err;
-                    return;
-                }
-                blocksToHash.Add(block);
-
-                if (mapentry.length > 0)
-                {
-                    arrPoolIn.Return(mapentry.buffIn);
-                    mapentry.buffIn = null;
-                }
-            }
-            catch (Exception e)
-            {
-                if (ct.IsCancellationRequested)
-                    return;
-                if (errMaster == chd_error.CHDERR_NONE)
-                    errMaster = chd_error.CHDERR_DECOMPRESSION_ERROR;
-                ts.Cancel();
-            }
-        });
-        allTasks.Add(decompressionThread);
-
-
         ulong sizetoGo = chd.totalbytes;
-        int proc = 0;
-        Task hashingThread = Task.Factory.StartNew(() =>
-        {
-            try
+
+        Task processorTask = queue.Process(
+            //decompress - parallel
+            (blockObj, threadIdx) =>
             {
-                while (true)
+                try
                 {
-                    int item = blocksToHash.Take(ct);
+                    CHDCodec codec = threadsState[threadIdx];
+                    mapentry mapentry = chd.map[(int)blockObj];
 
-                    chd.map[item].Processed = true;
-                    while (chd.map[proc].Processed == true)
+                    mapentry.buffOut = arrPoolOut.Rent();
+                    chd_error err = CHDBlockRead.ReadBlock(mapentry, arrPoolCache, chd.chdReader, codec, mapentry.buffOut, (int)chd.blocksize);
+                    //if (err != chd_error.CHDERR_NONE) //need to support cancellation token
+                    //{
+                    //    ts.Cancel();
+                    //    errMaster = err;
+                    //    return;
+                    //}
+
+                    if (mapentry.length > 0)
                     {
-                        int sizenext = sizetoGo > (ulong)chd.blocksize ? (int)chd.blocksize : (int)sizetoGo;
-
-                        mapentry mapentry = chd.map[proc];
-
-                        md5Check?.TransformBlock(mapentry.buffOut, 0, sizenext, null, 0);
-                        sha1Check?.TransformBlock(mapentry.buffOut, 0, sizenext, null, 0);
-
-                        arrPoolOut.Return(mapentry.buffOut);
-                        mapentry.buffOut = null;
-                        aheadLock.Release();
-
-                        /* prepare for the next block */
-                        sizetoGo -= (ulong)sizenext;
-
-                        proc++;
-                        if (proc == chd.totalblocks)
-                            return;
+                        arrPoolIn.Return(mapentry.buffIn);
+                        mapentry.buffIn = null;
                     }
                 }
-            }
-            catch
+                catch (Exception e)
+                {
+                    if (ct.IsCancellationRequested)
+                        return;
+                    if (errMaster == chd_error.CHDERR_NONE)
+                        errMaster = chd_error.CHDERR_DECOMPRESSION_ERROR;
+                    ts.Cancel();
+                }
+            },
+            //hash - linear feed in queue order
+            (blockObj) =>
             {
-                if (ct.IsCancellationRequested)
-                    return;
+                int sizenext = sizetoGo > (ulong)chd.blocksize ? (int)chd.blocksize : (int)sizetoGo;
 
-                if (errMaster == chd_error.CHDERR_NONE)
-                    errMaster = chd_error.CHDERR_DECOMPRESSION_ERROR;
-                ts.Cancel();
-            }
+                mapentry mapentry = chd.map[(int)blockObj];
 
-        });
-        allTasks.Add(hashingThread);
+                md5Check?.TransformBlock(mapentry.buffOut, 0, sizenext, null, 0);
+                sha1Check?.TransformBlock(mapentry.buffOut, 0, sizenext, null, 0);
+
+                arrPoolOut.Return(mapentry.buffOut);
+                mapentry.buffOut = null;
+                sizetoGo -= (ulong)sizenext;
+            });
+
+
+        //queue the blocks to process
 
         uint blockPercent = chd.totalblocks / 100;
         if (blockPercent == 0)
@@ -361,7 +324,7 @@ public static class CHD
 
             /* progress */
             if ((block % blockPercent) == 0)
-                Console.Write($"Verifying: {(long)block * 100 / chd.totalblocks:N0}%     Load buffer: {queue.QueueCount}   Hash buffer: {blocksToHash.Count}   \r");
+                Console.Write($"Verifying: {(long)block * 100 / chd.totalblocks:N0}%     Load buffer: {queue.QueueCount}   Hash buffer: {queue.ProcessingCount}   \r");
 
             mapentry mapentry = chd.map[block];
 
@@ -376,7 +339,7 @@ public static class CHD
         }
         queue.AddComplete();
 
-        Task.WaitAll(allTasks.ToArray());
+        processorTask.Wait();
 
 
         Console.WriteLine($"Verifying, 100% complete.");

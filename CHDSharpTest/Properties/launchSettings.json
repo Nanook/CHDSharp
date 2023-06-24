@@ -2,7 +2,7 @@
   "profiles": {
     "CHDSharpTest": {
       "commandName": "Project",
-      "commandLineArgs": "\"E:\\RomVault\\RomRoot\\MAME - CHDs\""
+      "commandLineArgs": "D:\\NKitFiles\\CHD\\tst"
     }
   }
 }
